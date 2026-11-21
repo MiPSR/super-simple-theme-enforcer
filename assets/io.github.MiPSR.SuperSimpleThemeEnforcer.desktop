@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Super Simple Theme Enforcer
+Comment=Apply or clean up user-side light and dark theme preferences
+Exec=sste
+Icon=io.github.MiPSR.SuperSimpleThemeEnforcer
+Terminal=false
+Categories=Settings;

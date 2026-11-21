@@ -1,0 +1,21 @@
+[package]
+name = "super-simple-theme-enforcer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license-file = "LICENSE"
+
+[[bin]]
+name = "sste"
+path = "src/main.rs"
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", default-features = false, features = ["accessibility", "dbus", "embedded-fonts", "svg"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
