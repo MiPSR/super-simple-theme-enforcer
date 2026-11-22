@@ -1,10 +1,11 @@
 mod config;
 
-use config::{Mode, Paths, Target};
-use rune::tok::{self, Theme};
+use config::{Catalog, Mode, Paths, Selection, Target};
+use rune::tok;
 use rune::{AppSpec, Color, Cx, El, ImageCache, SurfaceFit, TextStyle, Tx, col, el, row, text};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, Dialog, Divider, IconButton, Kit, PaletteSeed, root,
+    Button, ButtonVariant, Checkbox, ControlSize, Dialog, Divider, IconButton, Kit, PaletteSeed,
+    Select, SelectAppearance, root,
 };
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +38,11 @@ struct State {
     portal: Option<Mode>,
     portal_task: Arc<Mutex<Option<Option<Mode>>>>,
     wake: Option<rune::Waker>,
+    catalog: Catalog,
+    unavailable: [Option<String>; 6],
+    themes: [[Option<String>; 6]; 2],
+    styles: [Option<String>; 2],
+    open_select: Option<usize>,
 }
 
 impl Default for State {
@@ -45,9 +51,17 @@ impl Default for State {
             Ok(paths) => (Some(paths), None),
             Err(e) => (None, Some(e.to_string())),
         };
+        let catalog = Catalog::discover(paths.as_ref());
+        let unavailable = std::array::from_fn(|i| {
+            paths
+                .as_ref()
+                .map(|p| p.unavailable(Target::ALL[i]))
+                .unwrap_or_else(|| Some("Configuration directory unavailable".into()))
+        });
+        let selected = std::array::from_fn(|i| unavailable[i].is_none());
         Self {
             paths,
-            selected: [true, true, true, true, true, true],
+            selected,
             mode: Mode::Dark,
             feedback: None,
             confirm_remove: false,
@@ -56,24 +70,47 @@ impl Default for State {
             portal: None,
             portal_task: Arc::new(Mutex::new(None)),
             wake: None,
+            catalog,
+            unavailable,
+            themes: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            styles: [None, None],
+            open_select: None,
         }
     }
 }
 
 impl State {
+    fn mode_index(&self) -> usize {
+        usize::from(self.mode == Mode::Dark)
+    }
+    fn selection(&self, target: Target) -> Selection<'_> {
+        let i = Target::ALL.iter().position(|t| *t == target).unwrap();
+        let theme = self.themes[self.mode_index()][i].as_ref().and_then(|name| {
+            self.catalog
+                .choices(target)
+                .iter()
+                .find(|t| &t.name == name)
+        });
+        Selection {
+            theme,
+            style: self.styles[self.mode_index()].as_deref(),
+        }
+    }
+    fn ready(&self, target: Target, mode: Mode) -> bool {
+        self.paths.as_ref().is_some_and(|p| {
+            p.writable(target)
+                && (self.selection(target).theme.is_some() || p.can_apply_mode(target, mode))
+        })
+    }
     fn selected(&self) -> impl Iterator<Item = Target> + '_ {
         Target::ALL
             .into_iter()
             .enumerate()
-            .filter(|(i, t)| self.selected[*i] && t.supported())
+            .filter(|(i, _)| self.selected[*i] && self.unavailable[*i].is_none())
             .map(|(_, t)| t)
     }
     fn can_apply(&self) -> bool {
-        self.paths.as_ref().is_some_and(|p| {
-            self.selected().any(|t| {
-                p.can_apply_mode(t, self.mode) && p.current(t).ok() != Some(Some(self.mode))
-            })
-        })
+        self.selected().any(|t| self.ready(t, self.mode))
     }
     fn can_remove(&self) -> bool {
         self.paths
@@ -104,19 +141,33 @@ impl State {
                 Some(self.mode)
             };
             let Some(mode) = mode else { continue };
-            if !paths.can_apply_mode(t, mode) {
-                continue;
-            }
-            if paths.current(t).ok() == Some(Some(mode)) {
+            if !(if defaults {
+                paths.can_apply_mode(t, mode)
+            } else {
+                self.ready(t, mode)
+            }) {
+                errors.push(format!(
+                    "{}: no installed matching theme; choose one",
+                    t.name()
+                ));
                 continue;
             }
             let result = if defaults && t == Target::Gnome {
                 paths.remove(t) // inherit the administrator's dconf preference
             } else {
-                paths.apply(t, mode)
+                if defaults {
+                    paths.apply(t, mode)
+                } else {
+                    paths.apply_selected(t, mode, self.selection(t))
+                }
             };
             match result {
-                Ok(()) => changed += 1,
+                Ok(()) => {
+                    changed += 1;
+                    if t == Target::Plasma {
+                        config::notify_kde();
+                    }
+                }
                 Err(e) => errors.push(format!("{}: {e}", t.name())),
             }
         }
@@ -145,7 +196,12 @@ impl State {
                 continue;
             }
             match paths.remove(t) {
-                Ok(()) => changed += 1,
+                Ok(()) => {
+                    changed += 1;
+                    if t == Target::Plasma {
+                        config::notify_kde();
+                    }
+                }
                 Err(e) => errors.push(format!("{}: {e}", t.name())),
             }
         }
@@ -189,8 +245,8 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
     }
 }
 
-fn kit(s: &State) -> Kit {
-    let t = theme(s);
+fn kit(dark: bool) -> Kit {
+    let t = tok::theme(dark);
     let accent = rune::oklch(0.543, 0.093, 194.77);
     let mut k = Kit::from_palette(PaletteSeed {
         bg: t.bg,
@@ -203,10 +259,6 @@ fn kit(s: &State) -> Kit {
     k.c.submit_hover = Color::WHITE.alpha(0.12);
     k.c.contrast_pressed = Color::WHITE.alpha(0.20);
     k
-}
-
-fn theme(s: &State) -> Theme {
-    tok::theme(s.mode == Mode::Dark)
 }
 
 fn logo(s: &State) -> El {
@@ -223,9 +275,9 @@ fn logo(s: &State) -> El {
         .pixels_fit(image.pixels(), SurfaceFit::Fit)
 }
 
-fn view(s: &State, _cx: &mut Cx<State>) -> El {
-    let t = theme(s);
-    let k = kit(s);
+fn view(s: &State, cx: &mut Cx<State>) -> El {
+    let t = tok::theme(cx.system_dark());
+    let k = kit(cx.system_dark());
     let mut layer = Vec::new();
     let content = col()
         .key("app")
@@ -266,51 +318,40 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
                         .gap(12.0)
                         .child(
                             IconButton::new(&SUN)
-                                .label("Light theme")
+                                .label(if s.mode == Mode::Light {
+                                    "Light (pending)"
+                                } else {
+                                    "Choose light"
+                                })
                                 .control_size(ControlSize::Regular)
                                 .on_press(|s: &mut State| {
                                     s.mode = Mode::Light;
                                     s.feedback = None;
+                                    s.open_select = None;
                                 })
                                 .build(&k)
                                 .key("light"),
                         )
                         .child(
-                            Button::new("Light")
-                                .variant(if s.mode == Mode::Light {
-                                    ButtonVariant::Submit
-                                } else {
-                                    ButtonVariant::default()
-                                })
-                                .on_press(|s: &mut State| {
-                                    s.mode = Mode::Light;
-                                    s.feedback = None;
-                                })
-                                .build(&k),
-                        )
-                        .child(
                             IconButton::new(&MOON)
-                                .label("Dark theme")
+                                .label(if s.mode == Mode::Dark {
+                                    "Dark (pending)"
+                                } else {
+                                    "Choose dark"
+                                })
                                 .control_size(ControlSize::Regular)
                                 .on_press(|s: &mut State| {
                                     s.mode = Mode::Dark;
                                     s.feedback = None;
+                                    s.open_select = None;
                                 })
                                 .build(&k)
                                 .key("dark"),
                         )
                         .child(
-                            Button::new("Dark")
-                                .variant(if s.mode == Mode::Dark {
-                                    ButtonVariant::Submit
-                                } else {
-                                    ButtonVariant::default()
-                                })
-                                .on_press(|s: &mut State| {
-                                    s.mode = Mode::Dark;
-                                    s.feedback = None;
-                                })
-                                .build(&k),
+                            text(format!("{} — press Apply to save", s.mode.label()))
+                                .font(k.ty.small)
+                                .color(k.c.text_muted),
                         ),
                 ),
         )
@@ -323,6 +364,10 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
                 .px(22.0)
                 .pt(12.0)
                 .gap(2.0)
+                .min_h(0.0)
+                .scroll(rune::ScrollSpec {
+                    stick_bottom: false,
+                })
                 .child(
                     text("Apply to")
                         .font(TextStyle::new(14.0, 600.0))
@@ -332,12 +377,13 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
                     Target::ALL
                         .into_iter()
                         .enumerate()
-                        .map(|(i, target)| target_row(s, &k, i, target))
+                        .map(|(i, target)| target_row(s, &k, i, target, &mut layer))
                         .collect::<Vec<_>>(),
                 )
+                .child(style_row(s, &k, &mut layer))
                 .child(
                     text(format!(
-                        "Portal preference: {} (read-only). Nix-managed settings are left alone.",
+                        "Last portal read: {} (read-only). Window appearance follows the system. Nix-managed settings are left alone.",
                         s.portal.map(Mode::label).unwrap_or("No preference")
                     ))
                     .wrap()
@@ -360,7 +406,7 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
                         }
                         Target::Xfce => "xfconf: xsettings /Net/ThemeName (reset)".into(),
                         Target::Plasma => {
-                            format!("{}: ColorScheme and color groups only", p.user(t).display())
+                            format!("{}: ColorScheme (General / UiSettings), color groups and widgetStyle only", p.user(t).display())
                         }
                         Target::Qt6 => format!(
                             "{}\n{}",
@@ -377,7 +423,7 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
                     .join("\n")
             })
             .unwrap_or_default();
-        Dialog::new("remove", "Remove selected user overrides?")
+        Dialog::new("remove", "Delete selected user overrides?")
             .description("Deletes listed user theme files or resets the specified settings.")
             .fit()
             .open(true)
@@ -398,7 +444,7 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
                                     .build(&k),
                             )
                             .child(
-                                Button::new("Remove files")
+                                Button::new("Delete overrides")
                                     .variant(ButtonVariant::Submit)
                                     .on_press(|s: &mut State| s.remove())
                                     .build(&k),
@@ -431,59 +477,148 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
     root(content, layer)
 }
 
-fn target_row(s: &State, k: &Kit, i: usize, target: Target) -> El {
-    let supported = target.supported();
+fn target_row(s: &State, k: &Kit, i: usize, target: Target, layer: &mut Vec<El>) -> El {
     let paths = s.paths.as_ref();
-    let writable = paths.is_some_and(|p| p.writable(target));
-    let detail = if !supported {
-        "Set QT_QPA_PLATFORMTHEME=qt6ct to enable"
-    } else if !writable {
-        "Nix-managed / locked"
-    } else if !paths.is_some_and(|p| p.can_apply_mode(target, s.mode)) {
-        "No installed scheme for this mode"
+    let detail = if target == Target::Qt6 {
+        "Writes qt6ct configuration; only apps using qt6ct read it"
+    } else if target == Target::Plasma {
+        "kdeglobals: KDE widgets and Kirigami, inside or outside Plasma"
+    } else if !s.ready(target, s.mode) && s.unavailable[i].is_none() {
+        "Choose an installed theme for this mode"
     } else if paths.is_some_and(|p| p.exists(target)) {
         "User file present"
     } else {
         "No user file"
     };
-    row()
+    let mut content = col()
         .key(format!("target-{i}"))
         .w_full()
-        .h(53.0)
-        .gap(12.0)
-        .center_y()
+        .py(8.0)
+        .gap(5.0)
         .child(
-            col()
-                .grow(1.0)
-                .gap(3.0)
+            row()
+                .w_full()
+                .center_y()
+                .gap(10.0)
                 .child(
-                    text(target.name())
-                        .font(TextStyle::new(14.0, 600.0))
-                        .color(k.c.text_base),
+                    Checkbox::new(s.selected[i])
+                        .label(target.name())
+                        .disabled(s.unavailable[i].is_some() && !s.selected[i])
+                        .on_toggle(move |s: &mut State| {
+                            s.selected[i] = !s.selected[i];
+                            s.feedback = None;
+                            s.open_select = None;
+                        })
+                        .build(k),
                 )
-                .child(text(detail).font(k.ty.small).color(k.c.text_muted)),
-        )
-        .child(
-            Button::new(if s.selected[i] { "Selected" } else { "Select" })
-                .variant(if s.selected[i] {
-                    ButtonVariant::Submit
-                } else {
-                    ButtonVariant::default()
+                .child(el().grow(1.0))
+                .children(
+                    s.unavailable[i]
+                        .as_ref()
+                        .map(|reason| Button::new(reason).disabled(true).build(k))
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                ),
+        );
+    content = content.child(text(detail).font(k.ty.small).color(k.c.text_muted));
+    if target != Target::Gnome && s.selected[i] {
+        let choices = s.catalog.choices(target);
+        let automatic = match target {
+            Target::Plasma => "Breeze (matching mode)",
+            Target::Qt6 => "Generated palette (matching mode)",
+            Target::Xfce => "Match current theme family",
+            _ => "Keep current theme",
+        };
+        let options: Vec<_> = std::iter::once(automatic.to_owned())
+            .chain(choices.iter().map(|t| t.name.clone()))
+            .collect();
+        content = content.child(
+            Select::new(format!("theme-{i}"), &options)
+                .label(format!("{} theme for {}", target.name(), s.mode.label()))
+                .appearance(SelectAppearance::Field)
+                .current(Some(
+                    s.themes[s.mode_index()][i]
+                        .as_deref()
+                        .unwrap_or(&options[0]),
+                ))
+                .disabled(!s.selected[i] || s.unavailable[i].is_some() || choices.is_empty())
+                .open(s.open_select == Some(i))
+                .on_toggle(move |s: &mut State| {
+                    s.open_select = if s.open_select == Some(i) {
+                        None
+                    } else {
+                        Some(i)
+                    }
                 })
-                .disabled(
-                    !supported
-                        || !writable
-                        || !paths.is_some_and(|p| {
-                            p.exists(target)
-                                || p.can_apply_mode(target, s.mode)
-                                || p.default(target).ok().flatten().is_some()
-                        }),
-                )
-                .on_press(move |s: &mut State| {
-                    s.selected[i] = !s.selected[i];
+                .on_close(|s: &mut State| s.open_select = None)
+                .on_choose(move |s: &mut State, value, _| {
+                    let m = s.mode_index();
+                    s.themes[m][i] = (value != automatic).then(|| value.to_owned());
+                    s.open_select = None;
                     s.feedback = None;
                 })
-                .build(k),
+                .build(k, layer),
+        );
+        if choices.is_empty() {
+            content = content.child(
+                text("No installed themes discovered")
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            );
+        }
+    }
+    content
+}
+
+fn style_row(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let enabled = s
+        .selected()
+        .any(|t| matches!(t, Target::Qt6 | Target::Plasma));
+    if !enabled {
+        return el().key("no-qt-style");
+    }
+    let options: Vec<_> = std::iter::once("Keep existing style".to_owned())
+        .chain(s.catalog.styles.iter().cloned())
+        .collect();
+    col()
+        .w_full()
+        .gap(5.0)
+        .py(8.0)
+        .child(text("Qt widget style").font(k.ty.small))
+        .child(
+            Select::new("qt-style", &options)
+                .label("Qt widget style")
+                .appearance(SelectAppearance::Field)
+                .current(Some(
+                    s.styles[s.mode_index()].as_deref().unwrap_or(&options[0]),
+                ))
+                .disabled(!enabled || s.catalog.styles.is_empty())
+                .open(enabled && s.open_select == Some(6))
+                .on_toggle(|s: &mut State| {
+                    s.open_select = if s.open_select == Some(6) {
+                        None
+                    } else {
+                        Some(6)
+                    }
+                })
+                .on_close(|s: &mut State| s.open_select = None)
+                .on_choose(|s: &mut State, value, _| {
+                    let m = s.mode_index();
+                    s.styles[m] = (value != "Keep existing style").then(|| value.to_owned());
+                    s.open_select = None;
+                    s.feedback = None;
+                })
+                .build(k, layer),
+        )
+        .children(
+            (enabled && s.catalog.styles.is_empty())
+                .then(|| {
+                    Button::new("Qt style discovery unavailable (sste-qt-styles)")
+                        .disabled(true)
+                        .build(k)
+                })
+                .into_iter()
+                .collect::<Vec<_>>(),
         )
 }
 
@@ -508,9 +643,9 @@ fn footer(s: &State, k: &Kit) -> El {
         )
         .child(
             Button::new(if s.feedback == Some(Feedback::Removed) {
-                "Removed"
+                "Deleted"
             } else {
-                "Remove"
+                "Delete overrides"
             })
             .disabled(!s.can_remove())
             .on_press(|s: &mut State| {
@@ -566,4 +701,149 @@ fn main() {
             view,
         )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(system_dark: bool) -> rune::Runtime<State> {
+        // No discovery, commands, session bus, window or writes in UI tests.
+        let state = State {
+            paths: None,
+            selected: [false; 6],
+            mode: Mode::Dark,
+            feedback: None,
+            confirm_remove: false,
+            error: None,
+            icon_cache: None,
+            portal: None,
+            portal_task: Arc::new(Mutex::new(None)),
+            wake: None,
+            catalog: Catalog::default(),
+            unavailable: std::array::from_fn(|_| Some("Unavailable in test".into())),
+            themes: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            styles: [None, None],
+            open_select: None,
+        };
+        let mut rt = rune::Runtime::new(
+            state,
+            view,
+            (760.0, 650.0),
+            rune::Env {
+                system_dark,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.0);
+        rt
+    }
+
+    #[test]
+    fn pending_mode_never_recolors_the_app() {
+        let mut rt = runtime(true);
+        let before = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("app"))
+            .unwrap()
+            .fill;
+        let (x, y) = rt.find("light").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.mode, Mode::Light);
+        let after = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("app"))
+            .unwrap()
+            .fill;
+        assert_eq!(before, after);
+        assert_eq!(after, tok::theme(true).bg);
+        let light = runtime(false);
+        let actual = light
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("app"))
+            .unwrap()
+            .fill;
+        assert_eq!(actual, tok::theme(false).bg);
+        assert_eq!(light.state.mode, Mode::Dark);
+    }
+
+    #[test]
+    fn unavailable_targets_are_unchecked_and_explain_why() {
+        let rt = runtime(true);
+        let elements = rt.elements();
+        assert_eq!(elements.iter().filter(|e| e.role == "checkbox").count(), 6);
+        assert_eq!(
+            elements
+                .iter()
+                .filter(|e| e.role == "button" && e.label.as_deref() == Some("Unavailable in test"))
+                .count(),
+            6
+        );
+        assert!(rt.state.selected.iter().all(|s| !s));
+        assert!(
+            !elements
+                .iter()
+                .any(|e| e.key.as_deref() == Some("qt-style-trigger"))
+        );
+    }
+
+    #[test]
+    fn a_selected_target_can_be_unchecked_even_if_it_becomes_unavailable() {
+        let mut rt = runtime(true);
+        rt.state.selected[0] = true;
+        rt.invalidate();
+        rt.frame(1.0 / 60.0);
+        let checkbox = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.role == "checkbox" && e.label.as_deref() == Some(Target::Gnome.name()))
+            .unwrap();
+        assert!(checkbox.focusable);
+        let [x, y, w, h] = checkbox.rect;
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        rt.frame(2.0 / 60.0);
+        assert!(!rt.state.selected[0]);
+    }
+
+    #[test]
+    fn theme_and_style_dropdowns_require_the_matching_checked_target() {
+        let mut rt = runtime(true);
+        rt.state.unavailable = std::array::from_fn(|_| None);
+        rt.state.catalog.styles = vec!["Fusion".into()];
+        rt.state.catalog.qt = vec![config::ThemeChoice {
+            name: "Test".into(),
+            path: "/unused/test.conf".into(),
+        }];
+        rt.state.catalog.gtk3 = vec![config::ThemeChoice {
+            name: "Test".into(),
+            path: "/unused/gtk".into(),
+        }];
+        let focusable = |rt: &rune::Runtime<State>, key: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .is_some_and(|e| e.focusable)
+        };
+        rt.state.selected[1] = true;
+        rt.invalidate();
+        rt.frame(1.0 / 60.0);
+        assert!(focusable(&rt, "theme-1-trigger"));
+        assert!(!focusable(&rt, "theme-4-trigger"));
+        assert!(!focusable(&rt, "qt-style-trigger"));
+        rt.state.selected[4] = true;
+        rt.invalidate();
+        rt.frame(2.0 / 60.0);
+        assert!(focusable(&rt, "theme-4-trigger"));
+        assert!(focusable(&rt, "qt-style-trigger"));
+        rt.state.selected[4] = false;
+        rt.invalidate();
+        rt.frame(3.0 / 60.0);
+        assert!(!focusable(&rt, "qt-style-trigger"));
+    }
 }
